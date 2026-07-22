@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       senders:
-        description: "Adresses email des expediteurs (separees par des espaces). Laisser vide pour utiliser la liste par defaut."
+        description: "Adresses email dont on interroge directement la boite (separees par des espaces). Laisser vide pour utiliser la liste par defaut."
         required: false
         default: ""
-      mailbox:
-        description: "Boite mail a interroger"
+      keyword:
+        description: "Mot-cle a filtrer dans l'objet ou le nom du fichier (vide = pas de filtre)"
         required: false
-        default: "it@madavance.org"
+        default: "OV"
 
 jobs:
   extract:
@@ -39,7 +39,7 @@ jobs:
             SENDERS_ARGS="--senders ${{ inputs.senders }}"
           fi
           python extract_attachments.py \
-            --mailbox "${{ inputs.mailbox }}" \
+            --keyword "${{ inputs.keyword }}" \
             $SENDERS_ARGS \
             --output-dir ./pieces_jointes
 
