@@ -41,6 +41,7 @@ Usage :
 
 import argparse
 import base64
+import hashlib
 import os
 import re
 import sys
@@ -146,6 +147,22 @@ def make_keyword_matcher(keyword: str):
         return any(pattern.match(t) for t in tokens if t)
 
     return matcher
+
+
+def build_filename(received: str, subject: str, original_name: str, max_stem_len: int = 60) -> str:
+    """Construit un nom de fichier sur, en preservant toujours la vraie extension
+    d'origine (contrairement a une simple troncature qui peut, par coincidence,
+    couper juste apres un '.' et faire croire qu'une extension est deja presente
+    alors qu'elle a ete tronquee -> fichier sans extension, rejete par SharePoint)."""
+    base_name, dot, ext = original_name.rpartition(".")
+    stem_source = base_name if dot else original_name
+    stem = slugify(stem_source, max_stem_len)
+    prefix = f"{received}_{slugify(subject, 40)}_{stem}"
+    if dot and ext:
+        ext_clean = re.sub(r"[^A-Za-z0-9]", "", ext)[:10]
+        if ext_clean:
+            return f"{prefix}.{ext_clean.lower()}"
+    return prefix
 
 
 def unique_path(path: Path) -> Path:
@@ -281,18 +298,16 @@ def main() -> int:
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    # Dossier unique, centralise : plus de sous-dossier par boite. Le dedoublonnage
+    # (par contenu, via sha256) evite d'enregistrer/uploader deux fois le meme
+    # fichier quand il a ete echange entre plusieurs des boites interrogees.
+    seen_hashes: set = set()
     total_files = 0
+    total_duplicates = 0
     for mailbox in args.senders:
         print(f"\n--- Boite : {mailbox} ---")
         messages = list_all_messages_with_attachments(token, mailbox)
         print(f"{len(messages)} email(s) avec piece(s) jointe(s) dans cette boite (envoi + reception).")
-
-        mailbox_dir = output_root / slugify(mailbox)
-        mailbox_dir.mkdir(parents=True, exist_ok=True)
-
-        sp_mailbox_folder_id = None
-        if sp_drive_id:
-            sp_mailbox_folder_id = get_or_create_child_folder(token, sp_drive_id, sp_folder_id, mailbox)
 
         for msg in messages:
             subject = msg.get("subject") or "(sans objet)"
@@ -319,26 +334,31 @@ def main() -> int:
 
             for att in kept_attachments:
                 name = att.get("name") or f"piece_jointe_{att['id']}"
-                filename = f"{received}_{slugify(subject, 40)}_{slugify(name, 60)}"
-                # preserve l'extension d'origine si slugify l'a mangee
-                if "." in name and "." not in filename[-6:]:
-                    ext = name.rsplit(".", 1)[-1]
-                    filename = f"{filename}.{ext}"
+                filename = build_filename(received, subject, name)
 
                 content = download_attachment_bytes(token, mailbox, msg["id"], att["id"])
+                content_hash = hashlib.sha256(content).hexdigest()
 
-                dest = unique_path(mailbox_dir / filename)
+                if content_hash in seen_hashes:
+                    total_duplicates += 1
+                    print(f"    -> doublon ignore (deja recupere ailleurs): {name}")
+                    continue
+                seen_hashes.add(content_hash)
+
+                dest = unique_path(output_root / filename)
                 dest.write_bytes(content)
                 total_files += 1
                 print(f"    -> local: {dest}")
 
-                if sp_mailbox_folder_id:
-                    upload_file_to_sharepoint(token, sp_drive_id, sp_mailbox_folder_id, filename, content)
-                    print(f"    -> SharePoint: {mailbox}/{filename}")
+                if sp_folder_id:
+                    upload_file_to_sharepoint(token, sp_drive_id, sp_folder_id, filename, content)
+                    print(f"    -> SharePoint: {filename}")
 
     print(f"\nTermine. {total_files} piece(s) jointe(s) enregistree(s) dans {output_root.resolve()}")
+    if total_duplicates:
+        print(f"{total_duplicates} doublon(s) detecte(s) et ignore(s) (meme contenu deja enregistre).")
     if sp_drive_id:
-        print("Egalement deposees sur SharePoint (dossier cible + un sous-dossier par boite).")
+        print("Egalement deposees sur SharePoint, dans un seul dossier centralise (pas de sous-dossier par boite).")
     return 0
 
 
