@@ -86,8 +86,9 @@ def list_messages_from_sender(token: str, mailbox: str, sender: str) -> list[dic
         "$filter": f"from/emailAddress/address eq '{sender}' and hasAttachments eq true",
         "$select": "id,subject,from,receivedDateTime,hasAttachments",
         "$top": "100",
-        "$orderby": "receivedDateTime desc",
     }
+    # Note : ne pas combiner $filter et $orderby ici -> Graph renvoie
+    # "InefficientFilter" (400) sur /messages avec ce type de filtre.
     messages = []
     while url:
         resp = requests.get(url, headers=headers, params=params, timeout=30)
