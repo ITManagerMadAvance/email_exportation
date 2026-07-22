@@ -2,11 +2,15 @@
 """
 extract_attachments.py
 
-Extrait les pieces jointes des emails impliquant des adresses donnees
-(expediteur, destinataire ou en copie -- envoi comme reception), dans une
-boite Microsoft 365, via Microsoft Graph (app-only / client credentials),
-et les depose (optionnellement) dans un dossier SharePoint donne par un
-lien de partage.
+Extrait les pieces jointes des emails (envoi comme reception, dans toute la
+boite) de plusieurs comptes Microsoft 365 donnes, via Microsoft Graph
+(app-only / client credentials), et les depose (optionnellement) dans un
+dossier SharePoint donne par un lien de partage.
+
+Chaque adresse listee est interrogee comme sa PROPRE boite mail (pas de
+boite centrale) : /users/{adresse}/messages. Le filtre par mot-cle (ex:
+"OV" pour Ordre de Virement) s'applique ensuite sur l'objet de l'email et
+le nom des pieces jointes.
 
 Reutilise l'App Registration Entra ID "BackupOffice365" (deja utilisee pour
 l'automatisation mWater -> SharePoint), a laquelle il faut avoir ajoute la
@@ -28,10 +32,10 @@ Usage :
     python extract_attachments.py \
         --senders mickael.consultant@madavance.org rakitrynyavo@madavance.org holisoa.raharijaona@madavance.org
 
-    # Boite differente, dossier de sortie local different, sans SharePoint :
+    # Une seule boite, filtre desactive :
     python extract_attachments.py \
-        --mailbox it@madavance.org \
-        --senders mickael.consultant@madavance.org \
+        --senders rakitrynyavo@madavance.org \
+        --keyword "" \
         --output-dir ./pieces_jointes
 """
 
@@ -47,7 +51,6 @@ from urllib.parse import quote
 import requests
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-DEFAULT_MAILBOX = "it@madavance.org"
 DEFAULT_SENDERS = [
     "mickael.consultant@madavance.org",
     "rakitrynyavo@madavance.org",
@@ -81,17 +84,14 @@ def get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
 
 
 def list_all_messages_with_attachments(token: str, mailbox: str) -> list[dict]:
-    """Liste tous les messages avec pieces jointes de la boite (envoi + reception confondus).
-
-    On ne filtre plus par expediteur cote serveur : le tri par contact
-    (expediteur OU destinataire OU en copie) se fait ensuite cote client,
-    ce qui permet de couvrir aussi bien les emails recus de ces adresses
-    que ceux qui leur ont ete envoyes."""
+    """Liste tous les messages avec pieces jointes de la boite donnee
+    (envoi + reception confondus, car /users/{id}/messages couvre toute
+    la boite, pas seulement la reception)."""
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{GRAPH_BASE}/users/{mailbox}/messages"
     params = {
         "$filter": "hasAttachments eq true",
-        "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments",
+        "$select": "id,subject,from,receivedDateTime,hasAttachments",
         "$top": "100",
     }
     # Note : ne pas combiner $filter et $orderby ici -> Graph renvoie
@@ -105,20 +105,6 @@ def list_all_messages_with_attachments(token: str, mailbox: str) -> list[dict]:
         url = payload.get("@odata.nextLink")
         params = None  # nextLink embarque deja les query params
     return messages
-
-
-def message_involves_address(msg: dict, address: str) -> bool:
-    """Vrai si l'adresse est l'expediteur, un destinataire (To) ou en copie (Cc)."""
-    address = address.lower()
-    from_addr = ((msg.get("from") or {}).get("emailAddress") or {}).get("address", "")
-    if from_addr.lower() == address:
-        return True
-    recipients = (msg.get("toRecipients") or []) + (msg.get("ccRecipients") or [])
-    for r in recipients:
-        r_addr = (r.get("emailAddress") or {}).get("address", "")
-        if r_addr.lower() == address:
-            return True
-    return False
 
 
 def list_attachments(token: str, mailbox: str, message_id: str) -> list[dict]:
@@ -249,13 +235,12 @@ def upload_file_to_sharepoint(token: str, drive_id: str, parent_item_id: str, fi
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Extrait les pieces jointes d'expediteurs donnes.")
-    parser.add_argument("--mailbox", default=DEFAULT_MAILBOX, help=f"Boite mail a interroger (defaut: {DEFAULT_MAILBOX})")
+    parser = argparse.ArgumentParser(description="Extrait les pieces jointes de plusieurs boites mail donnees.")
     parser.add_argument(
         "--senders",
         nargs="+",
         default=DEFAULT_SENDERS,
-        help=f"Adresses email des expediteurs (defaut: {', '.join(DEFAULT_SENDERS)})",
+        help=f"Adresses email dont on interroge directement la boite (defaut: {', '.join(DEFAULT_SENDERS)})",
     )
     parser.add_argument("--output-dir", default="./pieces_jointes", help="Dossier de sortie local")
     parser.add_argument(
@@ -296,33 +281,33 @@ def main() -> int:
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    print("Recuperation de tous les emails avec pieces jointes de la boite (envoi + reception)...")
-    all_messages = list_all_messages_with_attachments(token, args.mailbox)
-    print(f"{len(all_messages)} email(s) avec piece(s) jointe(s) au total dans la boite.")
-
     total_files = 0
-    for sender in args.senders:
-        print(f"\n--- Contact : {sender} ---")
-        messages = [m for m in all_messages if message_involves_address(m, sender)]
-        print(f"{len(messages)} email(s) impliquant cette adresse (expediteur, destinataire ou copie).")
+    for mailbox in args.senders:
+        print(f"\n--- Boite : {mailbox} ---")
+        messages = list_all_messages_with_attachments(token, mailbox)
+        print(f"{len(messages)} email(s) avec piece(s) jointe(s) dans cette boite (envoi + reception).")
 
-        sender_dir = output_root / slugify(sender)
-        sender_dir.mkdir(parents=True, exist_ok=True)
+        mailbox_dir = output_root / slugify(mailbox)
+        mailbox_dir.mkdir(parents=True, exist_ok=True)
 
-        sp_sender_folder_id = None
+        sp_mailbox_folder_id = None
         if sp_drive_id:
-            sp_sender_folder_id = get_or_create_child_folder(token, sp_drive_id, sp_folder_id, sender)
+            sp_mailbox_folder_id = get_or_create_child_folder(token, sp_drive_id, sp_folder_id, mailbox)
 
         for msg in messages:
             subject = msg.get("subject") or "(sans objet)"
             received = (msg.get("receivedDateTime") or "")[:10]
-            attachments = list_attachments(token, args.mailbox, msg["id"])
+            attachments = list_attachments(token, mailbox, msg["id"])
             file_attachments = [a for a in attachments if a.get("@odata.type") == "#microsoft.graph.fileAttachment"]
 
             if not file_attachments:
                 continue
 
-            subject_matches = keyword_matches(subject)
+            # Filet de securite : en plus du token exact ("OV", "OV123"...), on
+            # declenche aussi sur "virement" dans l'objet (ex: emails intitules
+            # "2 Ordres de virement" sans le sigle "OV"). Les pieces jointes
+            # elles-memes suivent toujours la convention "OV <Nom>_<date>.ext".
+            subject_matches = keyword_matches(subject) or "virement" in subject.lower()
             kept_attachments = [
                 att for att in file_attachments
                 if subject_matches or keyword_matches(att.get("name") or "")
@@ -340,20 +325,20 @@ def main() -> int:
                     ext = name.rsplit(".", 1)[-1]
                     filename = f"{filename}.{ext}"
 
-                content = download_attachment_bytes(token, args.mailbox, msg["id"], att["id"])
+                content = download_attachment_bytes(token, mailbox, msg["id"], att["id"])
 
-                dest = unique_path(sender_dir / filename)
+                dest = unique_path(mailbox_dir / filename)
                 dest.write_bytes(content)
                 total_files += 1
                 print(f"    -> local: {dest}")
 
-                if sp_sender_folder_id:
-                    upload_file_to_sharepoint(token, sp_drive_id, sp_sender_folder_id, filename, content)
-                    print(f"    -> SharePoint: {sender}/{filename}")
+                if sp_mailbox_folder_id:
+                    upload_file_to_sharepoint(token, sp_drive_id, sp_mailbox_folder_id, filename, content)
+                    print(f"    -> SharePoint: {mailbox}/{filename}")
 
     print(f"\nTermine. {total_files} piece(s) jointe(s) enregistree(s) dans {output_root.resolve()}")
     if sp_drive_id:
-        print("Egalement deposees sur SharePoint (dossier cible + un sous-dossier par expediteur).")
+        print("Egalement deposees sur SharePoint (dossier cible + un sous-dossier par boite).")
     return 0
 
 
