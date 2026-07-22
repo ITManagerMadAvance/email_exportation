@@ -1,0 +1,44 @@
+name: Export pieces jointes
+
+on:
+  workflow_dispatch:
+    inputs:
+      senders:
+        description: "Adresse(s) email dont on interroge directement la boite (separees par des espaces)."
+        required: false
+        default: "eddy.rajaonarivony@madavance.org"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export attachments
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SHAREPOINT_FOLDER_LINK_PJ: ${{ secrets.SHAREPOINT_FOLDER_LINK_PJ }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+        run: |
+          python export_attachments.py \
+            --senders ${{ inputs.senders || 'eddy.rajaonarivony@madavance.org' }} \
+            --output-dir ./pieces_jointes
+
+      - name: Upload as artifact (copie temporaire de secours)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pieces-jointes
+          path: ./pieces_jointes
+          retention-days: 7
