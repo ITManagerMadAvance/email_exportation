@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       senders:
-        description: "Adresses email des expediteurs (separees par des espaces)"
-        required: true
+        description: "Adresses email des expediteurs (separees par des espaces). Laisser vide pour utiliser la liste par defaut."
+        required: false
+        default: ""
       mailbox:
         description: "Boite mail a interroger"
         required: false
@@ -31,15 +32,20 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SHAREPOINT_FOLDER_LINK: ${{ secrets.SHAREPOINT_FOLDER_LINK }}
         run: |
+          SENDERS_ARGS=""
+          if [ -n "${{ inputs.senders }}" ]; then
+            SENDERS_ARGS="--senders ${{ inputs.senders }}"
+          fi
           python extract_attachments.py \
             --mailbox "${{ inputs.mailbox }}" \
-            --senders ${{ inputs.senders }} \
+            $SENDERS_ARGS \
             --output-dir ./pieces_jointes
 
-      - name: Upload as artifact
+      - name: Upload as artifact (copie temporaire de secours)
         uses: actions/upload-artifact@v4
         with:
           name: pieces-jointes
           path: ./pieces_jointes
-          retention-days: 30
+          retention-days: 7
