@@ -2,7 +2,8 @@
 """
 extract_attachments.py
 
-Extrait les pieces jointes des emails recus d'expediteurs donnes, dans une
+Extrait les pieces jointes des emails impliquant des adresses donnees
+(expediteur, destinataire ou en copie -- envoi comme reception), dans une
 boite Microsoft 365, via Microsoft Graph (app-only / client credentials),
 et les depose (optionnellement) dans un dossier SharePoint donne par un
 lien de partage.
@@ -52,6 +53,7 @@ DEFAULT_SENDERS = [
     "rakitrynyavo@madavance.org",
     "holisoa.raharijaona@madavance.org",
 ]
+DEFAULT_KEYWORD = "OV"
 # Taille de chunk pour l'upload SharePoint : doit etre un multiple de 320 KiB.
 CHUNK_SIZE = 320 * 1024 * 30  # ~9,37 Mo
 
@@ -78,13 +80,18 @@ def get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     return resp.json()["access_token"]
 
 
-def list_messages_from_sender(token: str, mailbox: str, sender: str) -> list[dict]:
-    """Liste les messages d'un expediteur donne, avec pieces jointes, dans une boite."""
+def list_all_messages_with_attachments(token: str, mailbox: str) -> list[dict]:
+    """Liste tous les messages avec pieces jointes de la boite (envoi + reception confondus).
+
+    On ne filtre plus par expediteur cote serveur : le tri par contact
+    (expediteur OU destinataire OU en copie) se fait ensuite cote client,
+    ce qui permet de couvrir aussi bien les emails recus de ces adresses
+    que ceux qui leur ont ete envoyes."""
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{GRAPH_BASE}/users/{mailbox}/messages"
     params = {
-        "$filter": f"from/emailAddress/address eq '{sender}' and hasAttachments eq true",
-        "$select": "id,subject,from,receivedDateTime,hasAttachments",
+        "$filter": "hasAttachments eq true",
+        "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments",
         "$top": "100",
     }
     # Note : ne pas combiner $filter et $orderby ici -> Graph renvoie
@@ -98,6 +105,20 @@ def list_messages_from_sender(token: str, mailbox: str, sender: str) -> list[dic
         url = payload.get("@odata.nextLink")
         params = None  # nextLink embarque deja les query params
     return messages
+
+
+def message_involves_address(msg: dict, address: str) -> bool:
+    """Vrai si l'adresse est l'expediteur, un destinataire (To) ou en copie (Cc)."""
+    address = address.lower()
+    from_addr = ((msg.get("from") or {}).get("emailAddress") or {}).get("address", "")
+    if from_addr.lower() == address:
+        return True
+    recipients = (msg.get("toRecipients") or []) + (msg.get("ccRecipients") or [])
+    for r in recipients:
+        r_addr = (r.get("emailAddress") or {}).get("address", "")
+        if r_addr.lower() == address:
+            return True
+    return False
 
 
 def list_attachments(token: str, mailbox: str, message_id: str) -> list[dict]:
@@ -122,6 +143,23 @@ def slugify(value: str, max_len: int = 60) -> str:
     value = re.sub(r"[^\w\-. ]", "_", value).strip()
     value = re.sub(r"\s+", "_", value)
     return value[:max_len] or "sans_nom"
+
+
+def make_keyword_matcher(keyword: str):
+    """Construit un matcher qui reconnait un mot-cle en tant que token entier
+    (ex: 'OV', 'OV123', 'ov_2024'), pour eviter les faux positifs du type
+    'novembre' contenant la sous-chaine 'ov'. Si keyword est vide, tout matche."""
+    if not keyword:
+        return lambda text: True
+    pattern = re.compile(rf"^{re.escape(keyword)}\d*$", re.IGNORECASE)
+
+    def matcher(text: str) -> bool:
+        if not text:
+            return False
+        tokens = re.split(r"[^A-Za-z0-9]+", text)
+        return any(pattern.match(t) for t in tokens if t)
+
+    return matcher
 
 
 def unique_path(path: Path) -> Path:
@@ -221,6 +259,14 @@ def main() -> int:
     )
     parser.add_argument("--output-dir", default="./pieces_jointes", help="Dossier de sortie local")
     parser.add_argument(
+        "--keyword",
+        default=os.environ.get("FILTER_KEYWORD", DEFAULT_KEYWORD),
+        help=(
+            f"Mot-cle a rechercher dans l'objet de l'email OU le nom du fichier joint "
+            f"(defaut: {DEFAULT_KEYWORD}). Chaine vide pour desactiver le filtre."
+        ),
+    )
+    parser.add_argument(
         "--sharepoint-link",
         default=os.environ.get("SHAREPOINT_FOLDER_LINK"),
         help="Lien de partage du dossier SharePoint cible (optionnel, sinon variable SHAREPOINT_FOLDER_LINK)",
@@ -237,6 +283,10 @@ def main() -> int:
     print("Authentification Microsoft Graph (app-only)...")
     token = get_app_token(tenant_id, client_id, client_secret)
 
+    keyword_matches = make_keyword_matcher(args.keyword)
+    if args.keyword:
+        print(f"Filtre actif : objet OU nom de fichier contenant '{args.keyword}'.")
+
     sp_drive_id = sp_folder_id = None
     if args.sharepoint_link:
         print("Resolution du dossier SharePoint cible...")
@@ -246,11 +296,15 @@ def main() -> int:
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    print("Recuperation de tous les emails avec pieces jointes de la boite (envoi + reception)...")
+    all_messages = list_all_messages_with_attachments(token, args.mailbox)
+    print(f"{len(all_messages)} email(s) avec piece(s) jointe(s) au total dans la boite.")
+
     total_files = 0
     for sender in args.senders:
-        print(f"\n--- Expediteur : {sender} ---")
-        messages = list_messages_from_sender(token, args.mailbox, sender)
-        print(f"{len(messages)} email(s) avec piece(s) jointe(s) trouve(s).")
+        print(f"\n--- Contact : {sender} ---")
+        messages = [m for m in all_messages if message_involves_address(m, sender)]
+        print(f"{len(messages)} email(s) impliquant cette adresse (expediteur, destinataire ou copie).")
 
         sender_dir = output_root / slugify(sender)
         sender_dir.mkdir(parents=True, exist_ok=True)
@@ -268,9 +322,17 @@ def main() -> int:
             if not file_attachments:
                 continue
 
-            print(f"  [{received}] {subject} - {len(file_attachments)} piece(s) jointe(s)")
+            subject_matches = keyword_matches(subject)
+            kept_attachments = [
+                att for att in file_attachments
+                if subject_matches or keyword_matches(att.get("name") or "")
+            ]
+            if not kept_attachments:
+                continue
 
-            for att in file_attachments:
+            print(f"  [{received}] {subject} - {len(kept_attachments)}/{len(file_attachments)} piece(s) jointe(s) retenue(s)")
+
+            for att in kept_attachments:
                 name = att.get("name") or f"piece_jointe_{att['id']}"
                 filename = f"{received}_{slugify(subject, 40)}_{slugify(name, 60)}"
                 # preserve l'extension d'origine si slugify l'a mangee
