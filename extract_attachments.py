@@ -3,23 +3,31 @@
 extract_attachments.py
 
 Extrait les pieces jointes des emails recus d'expediteurs donnes, dans une
-boite Microsoft 365, via Microsoft Graph (app-only / client credentials).
+boite Microsoft 365, via Microsoft Graph (app-only / client credentials),
+et les depose (optionnellement) dans un dossier SharePoint donne par un
+lien de partage.
 
 Reutilise l'App Registration Entra ID "BackupOffice365" (deja utilisee pour
 l'automatisation mWater -> SharePoint), a laquelle il faut avoir ajoute la
 permission Application "Mail.Read" (ou "Mail.ReadBasic.All"), avec
-consentement admin accorde dans le portail Entra ID.
+consentement admin accorde dans le portail Entra ID. La permission
+Application "Sites.ReadWrite.All" (deja presente pour le backup mWater)
+est reutilisee pour l'upload SharePoint.
 
 Authentification via les memes secrets que le script de backup mWater :
     AZURE_TENANT_ID
     AZURE_CLIENT_ID
     AZURE_CLIENT_SECRET
 
+Optionnel, pour deposer les fichiers sur SharePoint en plus du disque local :
+    SHAREPOINT_FOLDER_LINK   (lien de partage du dossier cible, type
+                               https://xxx.sharepoint.com/:f:/s/.../...)
+
 Usage :
     python extract_attachments.py \
         --senders mickael.consultant@madavance.org rakitrynyavo@madavance.org holisoa.raharijaona@madavance.org
 
-    # Boite differente ou dossier de sortie different :
+    # Boite differente, dossier de sortie local different, sans SharePoint :
     python extract_attachments.py \
         --mailbox it@madavance.org \
         --senders mickael.consultant@madavance.org \
@@ -27,16 +35,25 @@ Usage :
 """
 
 import argparse
+import base64
 import os
 import re
 import sys
 import unicodedata
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 DEFAULT_MAILBOX = "it@madavance.org"
+DEFAULT_SENDERS = [
+    "mickael.consultant@madavance.org",
+    "rakitrynyavo@madavance.org",
+    "holisoa.raharijaona@madavance.org",
+]
+# Taille de chunk pour l'upload SharePoint : doit etre un multiple de 320 KiB.
+CHUNK_SIZE = 320 * 1024 * 30  # ~9,37 Mo
 
 
 def raise_for_status_verbose(resp: requests.Response) -> None:
@@ -119,11 +136,94 @@ def unique_path(path: Path) -> Path:
         i += 1
 
 
+# --- SharePoint (Microsoft Graph) ------------------------------------------------
+
+
+def encode_sharing_url(url: str) -> str:
+    """Encode une URL de partage au format attendu par /shares/{id}."""
+    b64 = base64.urlsafe_b64encode(url.encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"u!{b64}"
+
+
+def resolve_share_link(token: str, share_url: str) -> tuple[str, str]:
+    """Resout un lien de partage SharePoint en (driveId, itemId) du dossier cible."""
+    headers = {"Authorization": f"Bearer {token}"}
+    encoded = encode_sharing_url(share_url)
+    url = f"{GRAPH_BASE}/shares/{encoded}/driveItem"
+    resp = requests.get(url, headers=headers, timeout=30)
+    raise_for_status_verbose(resp)
+    item = resp.json()
+    drive_id = item["parentReference"]["driveId"]
+    item_id = item["id"]
+    return drive_id, item_id
+
+
+def get_or_create_child_folder(token: str, drive_id: str, parent_item_id: str, name: str) -> str:
+    """Trouve un sous-dossier par nom sous un item donne, ou le cree s'il n'existe pas."""
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}/children"
+    resp = requests.get(url, headers=headers, params={"$select": "id,name,folder"}, timeout=30)
+    raise_for_status_verbose(resp)
+    for item in resp.json().get("value", []):
+        if item.get("folder") is not None and item.get("name") == name:
+            return item["id"]
+
+    resp = requests.post(
+        url,
+        headers={**headers, "Content-Type": "application/json"},
+        json={"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "rename"},
+        timeout=30,
+    )
+    raise_for_status_verbose(resp)
+    return resp.json()["id"]
+
+
+def upload_file_to_sharepoint(token: str, drive_id: str, parent_item_id: str, filename: str, content: bytes) -> None:
+    """Upload un fichier (petit ou volumineux) dans un dossier SharePoint via upload session."""
+    headers = {"Authorization": f"Bearer {token}"}
+    safe_name = quote(filename)
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}:/{safe_name}:/createUploadSession"
+    resp = requests.post(
+        url,
+        headers={**headers, "Content-Type": "application/json"},
+        json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+        timeout=30,
+    )
+    raise_for_status_verbose(resp)
+    upload_url = resp.json()["uploadUrl"]
+
+    total = len(content)
+    start = 0
+    while start < total:
+        end = min(start + CHUNK_SIZE, total) - 1
+        chunk = content[start:end + 1]
+        put_headers = {
+            "Content-Length": str(len(chunk)),
+            "Content-Range": f"bytes {start}-{end}/{total}",
+        }
+        resp = requests.put(upload_url, headers=put_headers, data=chunk, timeout=120)
+        raise_for_status_verbose(resp)
+        start = end + 1
+
+
+# --- Programme principal ----------------------------------------------------------
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Extrait les pieces jointes d'expediteurs donnes.")
     parser.add_argument("--mailbox", default=DEFAULT_MAILBOX, help=f"Boite mail a interroger (defaut: {DEFAULT_MAILBOX})")
-    parser.add_argument("--senders", nargs="+", required=True, help="Adresses email des expediteurs")
-    parser.add_argument("--output-dir", default="./pieces_jointes", help="Dossier de sortie")
+    parser.add_argument(
+        "--senders",
+        nargs="+",
+        default=DEFAULT_SENDERS,
+        help=f"Adresses email des expediteurs (defaut: {', '.join(DEFAULT_SENDERS)})",
+    )
+    parser.add_argument("--output-dir", default="./pieces_jointes", help="Dossier de sortie local")
+    parser.add_argument(
+        "--sharepoint-link",
+        default=os.environ.get("SHAREPOINT_FOLDER_LINK"),
+        help="Lien de partage du dossier SharePoint cible (optionnel, sinon variable SHAREPOINT_FOLDER_LINK)",
+    )
     args = parser.parse_args()
 
     tenant_id = os.environ.get("AZURE_TENANT_ID")
@@ -136,6 +236,12 @@ def main() -> int:
     print("Authentification Microsoft Graph (app-only)...")
     token = get_app_token(tenant_id, client_id, client_secret)
 
+    sp_drive_id = sp_folder_id = None
+    if args.sharepoint_link:
+        print("Resolution du dossier SharePoint cible...")
+        sp_drive_id, sp_folder_id = resolve_share_link(token, args.sharepoint_link)
+        print(f"  -> driveId={sp_drive_id} folderId={sp_folder_id}")
+
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -147,6 +253,10 @@ def main() -> int:
 
         sender_dir = output_root / slugify(sender)
         sender_dir.mkdir(parents=True, exist_ok=True)
+
+        sp_sender_folder_id = None
+        if sp_drive_id:
+            sp_sender_folder_id = get_or_create_child_folder(token, sp_drive_id, sp_folder_id, sender)
 
         for msg in messages:
             subject = msg.get("subject") or "(sans objet)"
@@ -167,13 +277,20 @@ def main() -> int:
                     ext = name.rsplit(".", 1)[-1]
                     filename = f"{filename}.{ext}"
 
-                dest = unique_path(sender_dir / filename)
                 content = download_attachment_bytes(token, args.mailbox, msg["id"], att["id"])
+
+                dest = unique_path(sender_dir / filename)
                 dest.write_bytes(content)
                 total_files += 1
-                print(f"    -> {dest}")
+                print(f"    -> local: {dest}")
+
+                if sp_sender_folder_id:
+                    upload_file_to_sharepoint(token, sp_drive_id, sp_sender_folder_id, filename, content)
+                    print(f"    -> SharePoint: {sender}/{filename}")
 
     print(f"\nTermine. {total_files} piece(s) jointe(s) enregistree(s) dans {output_root.resolve()}")
+    if sp_drive_id:
+        print("Egalement deposees sur SharePoint (dossier cible + un sous-dossier par expediteur).")
     return 0
 
 
