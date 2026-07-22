@@ -1,1 +1,45 @@
+name: Extraction pieces jointes
 
+on:
+  workflow_dispatch:
+    inputs:
+      senders:
+        description: "Adresses email des expediteurs (separees par des espaces)"
+        required: true
+      mailbox:
+        description: "Boite mail a interroger"
+        required: false
+        default: "it@madavance.org"
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Extract attachments
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          python extract_attachments.py \
+            --mailbox "${{ inputs.mailbox }}" \
+            --senders ${{ inputs.senders }} \
+            --output-dir ./pieces_jointes
+
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pieces-jointes
+          path: ./pieces_jointes
+          retention-days: 30
