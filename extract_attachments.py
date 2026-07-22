@@ -24,6 +24,10 @@ Authentification via les memes secrets que le script de backup mWater :
     AZURE_CLIENT_ID
     AZURE_CLIENT_SECRET
 
+Le token app-only expire au bout d'environ 1h. Comme un run peut durer plus
+longtemps (beaucoup de boites/pieces jointes), le token est rafraichi
+automatiquement avant expiration et sur toute reponse 401 en cours de route.
+
 Optionnel, pour deposer les fichiers sur SharePoint en plus du disque local :
     SHAREPOINT_FOLDER_LINK   (lien de partage du dossier cible, type
                                https://xxx.sharepoint.com/:f:/s/.../...)
@@ -45,6 +49,7 @@ import hashlib
 import os
 import re
 import sys
+import time
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote
@@ -60,6 +65,8 @@ DEFAULT_SENDERS = [
 DEFAULT_KEYWORD = "OV"
 # Taille de chunk pour l'upload SharePoint : doit etre un multiple de 320 KiB.
 CHUNK_SIZE = 320 * 1024 * 30  # ~9,37 Mo
+# Marge de securite avant expiration du token pour declencher un refresh proactif.
+TOKEN_REFRESH_MARGIN_SECONDS = 120
 
 
 def raise_for_status_verbose(resp: requests.Response) -> None:
@@ -70,25 +77,69 @@ def raise_for_status_verbose(resp: requests.Response) -> None:
         )
 
 
-def get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
-    """Authentification app-only (client credentials) aupres de Microsoft Graph."""
-    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "https://graph.microsoft.com/.default",
-    }
-    resp = requests.post(url, data=data, timeout=30)
-    raise_for_status_verbose(resp)
-    return resp.json()["access_token"]
+class GraphSession:
+    """Gere le token app-only (client credentials) et le rafraichit automatiquement :
+    - de maniere proactive, avant qu'il n'expire (marge de securite) ;
+    - de maniere reactive, si un appel renvoie quand meme 401 (horloge, latence...).
+    Toutes les requetes Graph du script passent par ici plutot que par un token
+    brut, pour eviter le crash "token is expired" en plein milieu d'un run long."""
+
+    def __init__(self, tenant_id: str, client_id: str, client_secret: str):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self._token = None
+        self._expires_at = 0
+
+    def _fetch_token(self) -> None:
+        url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+        }
+        resp = requests.post(url, data=data, timeout=30)
+        raise_for_status_verbose(resp)
+        payload = resp.json()
+        self._token = payload["access_token"]
+        expires_in = int(payload.get("expires_in", 3599))
+        self._expires_at = time.time() + expires_in
+
+    def _token_value(self, force_refresh: bool = False) -> str:
+        if force_refresh or self._token is None or time.time() >= self._expires_at - TOKEN_REFRESH_MARGIN_SECONDS:
+            self._fetch_token()
+        return self._token
+
+    def ensure_ready(self) -> None:
+        """Force une premiere authentification (echoue vite si les secrets sont faux)."""
+        self._token_value()
+
+    def request(self, method: str, url: str, **kwargs) -> requests.Response:
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers["Authorization"] = f"Bearer {self._token_value()}"
+        resp = requests.request(method, url, headers=headers, **kwargs)
+        if resp.status_code == 401:
+            # Le token a pu expirer entre le check proactif et l'appel reel
+            # (run long, latence reseau...). On force un refresh et on retente une fois.
+            headers["Authorization"] = f"Bearer {self._token_value(force_refresh=True)}"
+            resp = requests.request(method, url, headers=headers, **kwargs)
+        return resp
+
+    def get(self, url: str, **kwargs) -> requests.Response:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs) -> requests.Response:
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url: str, **kwargs) -> requests.Response:
+        return self.request("PUT", url, **kwargs)
 
 
-def list_all_messages_with_attachments(token: str, mailbox: str) -> list[dict]:
+def list_all_messages_with_attachments(session: GraphSession, mailbox: str) -> list[dict]:
     """Liste tous les messages avec pieces jointes de la boite donnee
     (envoi + reception confondus, car /users/{id}/messages couvre toute
     la boite, pas seulement la reception)."""
-    headers = {"Authorization": f"Bearer {token}"}
     url = f"{GRAPH_BASE}/users/{mailbox}/messages"
     params = {
         "$filter": "hasAttachments eq true",
@@ -99,7 +150,7 @@ def list_all_messages_with_attachments(token: str, mailbox: str) -> list[dict]:
     # "InefficientFilter" (400) sur /messages avec ce type de filtre.
     messages = []
     while url:
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp = session.get(url, params=params, timeout=30)
         raise_for_status_verbose(resp)
         payload = resp.json()
         messages.extend(payload.get("value", []))
@@ -108,18 +159,16 @@ def list_all_messages_with_attachments(token: str, mailbox: str) -> list[dict]:
     return messages
 
 
-def list_attachments(token: str, mailbox: str, message_id: str) -> list[dict]:
-    headers = {"Authorization": f"Bearer {token}"}
+def list_attachments(session: GraphSession, mailbox: str, message_id: str) -> list[dict]:
     url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments"
-    resp = requests.get(url, headers=headers, timeout=30)
+    resp = session.get(url, timeout=30)
     raise_for_status_verbose(resp)
     return resp.json().get("value", [])
 
 
-def download_attachment_bytes(token: str, mailbox: str, message_id: str, attachment_id: str) -> bytes:
-    headers = {"Authorization": f"Bearer {token}"}
+def download_attachment_bytes(session: GraphSession, mailbox: str, message_id: str, attachment_id: str) -> bytes:
     url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments/{attachment_id}/$value"
-    resp = requests.get(url, headers=headers, timeout=120)
+    resp = session.get(url, timeout=120)
     raise_for_status_verbose(resp)
     return resp.content
 
@@ -187,12 +236,11 @@ def encode_sharing_url(url: str) -> str:
     return f"u!{b64}"
 
 
-def resolve_share_link(token: str, share_url: str) -> tuple[str, str]:
+def resolve_share_link(session: GraphSession, share_url: str) -> tuple[str, str]:
     """Resout un lien de partage SharePoint en (driveId, itemId) du dossier cible."""
-    headers = {"Authorization": f"Bearer {token}"}
     encoded = encode_sharing_url(share_url)
     url = f"{GRAPH_BASE}/shares/{encoded}/driveItem"
-    resp = requests.get(url, headers=headers, timeout=30)
+    resp = session.get(url, timeout=30)
     raise_for_status_verbose(resp)
     item = resp.json()
     drive_id = item["parentReference"]["driveId"]
@@ -200,19 +248,18 @@ def resolve_share_link(token: str, share_url: str) -> tuple[str, str]:
     return drive_id, item_id
 
 
-def get_or_create_child_folder(token: str, drive_id: str, parent_item_id: str, name: str) -> str:
+def get_or_create_child_folder(session: GraphSession, drive_id: str, parent_item_id: str, name: str) -> str:
     """Trouve un sous-dossier par nom sous un item donne, ou le cree s'il n'existe pas."""
-    headers = {"Authorization": f"Bearer {token}"}
     url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}/children"
-    resp = requests.get(url, headers=headers, params={"$select": "id,name,folder"}, timeout=30)
+    resp = session.get(url, params={"$select": "id,name,folder"}, timeout=30)
     raise_for_status_verbose(resp)
     for item in resp.json().get("value", []):
         if item.get("folder") is not None and item.get("name") == name:
             return item["id"]
 
-    resp = requests.post(
+    resp = session.post(
         url,
-        headers={**headers, "Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"},
         json={"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "rename"},
         timeout=30,
     )
@@ -220,14 +267,39 @@ def get_or_create_child_folder(token: str, drive_id: str, parent_item_id: str, n
     return resp.json()["id"]
 
 
-def upload_file_to_sharepoint(token: str, drive_id: str, parent_item_id: str, filename: str, content: bytes) -> None:
+def get_year_month_folder(
+    session: GraphSession,
+    drive_id: str,
+    base_folder_id: str,
+    year: str,
+    month: str,
+    cache: dict,
+) -> str:
+    """Retourne l'id du sous-dossier {annee}/{mois} sous base_folder_id, en le
+    creant si besoin. Les resultats sont mis en cache pour eviter de refaire
+    les memes appels Graph pour chaque piece jointe du meme mois."""
+    key = (year, month)
+    if key in cache:
+        return cache[key]
+
+    year_key = (year, "")
+    year_folder_id = cache.get(year_key)
+    if year_folder_id is None:
+        year_folder_id = get_or_create_child_folder(session, drive_id, base_folder_id, year)
+        cache[year_key] = year_folder_id
+
+    month_folder_id = get_or_create_child_folder(session, drive_id, year_folder_id, month)
+    cache[key] = month_folder_id
+    return month_folder_id
+
+
+def upload_file_to_sharepoint(session: GraphSession, drive_id: str, parent_item_id: str, filename: str, content: bytes) -> None:
     """Upload un fichier (petit ou volumineux) dans un dossier SharePoint via upload session."""
-    headers = {"Authorization": f"Bearer {token}"}
     safe_name = quote(filename)
     url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}:/{safe_name}:/createUploadSession"
-    resp = requests.post(
+    resp = session.post(
         url,
-        headers={**headers, "Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"},
         json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
         timeout=30,
     )
@@ -239,6 +311,8 @@ def upload_file_to_sharepoint(token: str, drive_id: str, parent_item_id: str, fi
     while start < total:
         end = min(start + CHUNK_SIZE, total) - 1
         chunk = content[start:end + 1]
+        # L'upload session Graph a sa propre URL pre-signee : pas besoin (ni
+        # souhaitable) d'y rajouter le header Authorization app-only.
         put_headers = {
             "Content-Length": str(len(chunk)),
             "Content-Range": f"bytes {start}-{end}/{total}",
@@ -283,7 +357,8 @@ def main() -> int:
         return 1
 
     print("Authentification Microsoft Graph (app-only)...")
-    token = get_app_token(tenant_id, client_id, client_secret)
+    session = GraphSession(tenant_id, client_id, client_secret)
+    session.ensure_ready()
 
     keyword_matches = make_keyword_matcher(args.keyword)
     if args.keyword:
@@ -292,27 +367,29 @@ def main() -> int:
     sp_drive_id = sp_folder_id = None
     if args.sharepoint_link:
         print("Resolution du dossier SharePoint cible...")
-        sp_drive_id, sp_folder_id = resolve_share_link(token, args.sharepoint_link)
+        sp_drive_id, sp_folder_id = resolve_share_link(session, args.sharepoint_link)
         print(f"  -> driveId={sp_drive_id} folderId={sp_folder_id}")
 
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Dossier unique, centralise : plus de sous-dossier par boite. Le dedoublonnage
-    # (par contenu, via sha256) evite d'enregistrer/uploader deux fois le meme
-    # fichier quand il a ete echange entre plusieurs des boites interrogees.
+    # Classement par annee/mois (date de reception) : plus de sous-dossier par
+    # boite, mais un sous-dossier {annee}/{mois} sous le dossier cible. Le
+    # dedoublonnage (par contenu, via sha256) evite d'enregistrer/uploader deux
+    # fois le meme fichier quand il a ete echange entre plusieurs boites.
     seen_hashes: set = set()
+    sp_folder_cache: dict[tuple[str, str], str] = {}
     total_files = 0
     total_duplicates = 0
     for mailbox in args.senders:
         print(f"\n--- Boite : {mailbox} ---")
-        messages = list_all_messages_with_attachments(token, mailbox)
+        messages = list_all_messages_with_attachments(session, mailbox)
         print(f"{len(messages)} email(s) avec piece(s) jointe(s) dans cette boite (envoi + reception).")
 
         for msg in messages:
             subject = msg.get("subject") or "(sans objet)"
             received = (msg.get("receivedDateTime") or "")[:10]
-            attachments = list_attachments(token, mailbox, msg["id"])
+            attachments = list_attachments(session, mailbox, msg["id"])
             file_attachments = [a for a in attachments if a.get("@odata.type") == "#microsoft.graph.fileAttachment"]
 
             if not file_attachments:
@@ -332,11 +409,16 @@ def main() -> int:
 
             print(f"  [{received}] {subject} - {len(kept_attachments)}/{len(file_attachments)} piece(s) jointe(s) retenue(s)")
 
+            # Classement par annee/mois de reception (ex: 2025/11). Repli sur
+            # "date_inconnue" si jamais receivedDateTime est absent.
+            year = received[:4] if len(received) >= 7 else "date_inconnue"
+            month = received[5:7] if len(received) >= 7 else "date_inconnue"
+
             for att in kept_attachments:
                 name = att.get("name") or f"piece_jointe_{att['id']}"
                 filename = build_filename(received, subject, name)
 
-                content = download_attachment_bytes(token, mailbox, msg["id"], att["id"])
+                content = download_attachment_bytes(session, mailbox, msg["id"], att["id"])
                 content_hash = hashlib.sha256(content).hexdigest()
 
                 if content_hash in seen_hashes:
@@ -345,20 +427,23 @@ def main() -> int:
                     continue
                 seen_hashes.add(content_hash)
 
-                dest = unique_path(output_root / filename)
+                local_dir = output_root / year / month
+                local_dir.mkdir(parents=True, exist_ok=True)
+                dest = unique_path(local_dir / filename)
                 dest.write_bytes(content)
                 total_files += 1
                 print(f"    -> local: {dest}")
 
                 if sp_folder_id:
-                    upload_file_to_sharepoint(token, sp_drive_id, sp_folder_id, filename, content)
-                    print(f"    -> SharePoint: {filename}")
+                    sp_month_folder_id = get_year_month_folder(session, sp_drive_id, sp_folder_id, year, month, sp_folder_cache)
+                    upload_file_to_sharepoint(session, sp_drive_id, sp_month_folder_id, filename, content)
+                    print(f"    -> SharePoint: {year}/{month}/{filename}")
 
     print(f"\nTermine. {total_files} piece(s) jointe(s) enregistree(s) dans {output_root.resolve()}")
     if total_duplicates:
         print(f"{total_duplicates} doublon(s) detecte(s) et ignore(s) (meme contenu deja enregistre).")
     if sp_drive_id:
-        print("Egalement deposees sur SharePoint, dans un seul dossier centralise (pas de sous-dossier par boite).")
+        print("Egalement deposees sur SharePoint, classees par sous-dossiers annee/mois (pas de sous-dossier par boite).")
     return 0
 
 
