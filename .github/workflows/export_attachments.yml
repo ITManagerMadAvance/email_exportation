@@ -1,4 +1,4 @@
-name: Export pieces jointes
+name: Extraction pieces jointes
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         default: "eddy.rajaonarivony@madavance.org"
 
 jobs:
-  export:
+  extract-attachments:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Export attachments
+      - name: Extract all attachments (no filter)
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -39,6 +39,6 @@ jobs:
       - name: Upload as artifact (copie temporaire de secours)
         uses: actions/upload-artifact@v4
         with:
-          name: pieces-jointes
+          name: toutes-pieces-jointes
           path: ./pieces_jointes
           retention-days: 7
