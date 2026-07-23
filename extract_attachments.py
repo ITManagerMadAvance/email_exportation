@@ -60,9 +60,10 @@ import requests
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 DEFAULT_SENDERS = [
-    "mickael.consultant@madavance.org",
-    "rakitrynyavo@madavance.org",
-    "holisoa.raharijaona@madavance.org",
+    #"mickael.consultant@madavance.org",
+    #"rakitrynyavo@madavance.org",
+    #"holisoa.raharijaona@madavance.org",
+    "olivia@madavance.org",
 ]
 DEFAULT_KEYWORD = "OV"
 # Taille de chunk pour l'upload SharePoint : doit etre un multiple de 320 KiB.
