@@ -1,0 +1,47 @@
+name: Diagnostic eDiscovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      case_name:
+        description: "Nom du cas Purview (visible dans l'URL/breadcrumb du portail)"
+        required: false
+        default: "Content Search"
+      search_name:
+        description: "Nom de la recherche a inspecter"
+        required: false
+        default: "Eddy"
+      do_export:
+        description: "Tenter en plus de declencher un export via l'API (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  ediscovery-diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Diagnostic eDiscovery
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          EXPORT_FLAG=""
+          if [ "${{ inputs.do_export }}" = "true" ]; then
+            EXPORT_FLAG="--export"
+          fi
+          python ediscovery_export.py \
+            --case-name "${{ inputs.case_name || 'Content Search' }}" \
+            --search-name "${{ inputs.search_name || 'Eddy' }}" \
+            $EXPORT_FLAG
