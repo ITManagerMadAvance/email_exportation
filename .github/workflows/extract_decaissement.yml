@@ -1,0 +1,46 @@
+name: Extraction Decaissement
+
+on:
+  workflow_dispatch:
+    inputs:
+      senders:
+        description: "Adresse(s) email a interroger (separees par des espaces). Vide = admin@madavance.org par defaut."
+        required: false
+        default: ""
+
+jobs:
+  extract-decaissement:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Extract Decaissement
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SHAREPOINT_FOLDER_LINK_DECAISSEMENT: ${{ secrets.SHAREPOINT_FOLDER_LINK_DECAISSEMENT }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+        run: |
+          SENDERS_ARGS=""
+          if [ -n "${{ inputs.senders }}" ]; then
+            SENDERS_ARGS="--senders ${{ inputs.senders }}"
+          fi
+          python extract_decaissement.py $SENDERS_ARGS
+
+      - name: Upload as artifact (copie temporaire de secours)
+        uses: actions/upload-artifact@v4
+        with:
+          name: decaissement-extraits
+          path: ./decaissement
+          retention-days: 7
