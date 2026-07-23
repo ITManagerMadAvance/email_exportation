@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-extract_attachments.py
+extract_attachments.py -- "Extraction OV"
 
 Extrait les pieces jointes des emails (envoi comme reception, dans toute la
 boite) de plusieurs comptes Microsoft 365 donnes, via Microsoft Graph
@@ -50,7 +50,9 @@ import os
 import re
 import sys
 import time
+import traceback
 import unicodedata
+from datetime import date
 from pathlib import Path
 from urllib.parse import quote
 
@@ -58,16 +60,21 @@ import requests
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 DEFAULT_SENDERS = [
-    #"mickael.consultant@madavance.org",
-    #"rakitrynyavo@madavance.org",
-    #"holisoa.raharijaona@madavance.org",
-    "olivia@madavance.org",
+    "mickael.consultant@madavance.org",
+    "rakitrynyavo@madavance.org",
+    "holisoa.raharijaona@madavance.org",
 ]
 DEFAULT_KEYWORD = "OV"
 # Taille de chunk pour l'upload SharePoint : doit etre un multiple de 320 KiB.
 CHUNK_SIZE = 320 * 1024 * 30  # ~9,37 Mo
 # Marge de securite avant expiration du token pour declencher un refresh proactif.
 TOKEN_REFRESH_MARGIN_SECONDS = 120
+# Codes HTTP transitoires (surcharge/maintenance cote Graph ou SharePoint) : on
+# retente au lieu d'abandonner tout de suite. Vu en prod : 503 serviceNotAvailable
+# pendant un upload SharePoint, avec un retryAfterSeconds fourni par l'API.
+TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_TRANSIENT_RETRIES = 5
+MAX_RETRY_DELAY_SECONDS = 60
 
 
 def raise_for_status_verbose(resp: requests.Response) -> None:
@@ -76,6 +83,40 @@ def raise_for_status_verbose(resp: requests.Response) -> None:
         raise RuntimeError(
             f"Erreur HTTP {resp.status_code} sur {resp.request.method} {resp.url}\n{resp.text}"
         )
+
+
+def _compute_retry_delay(resp: requests.Response, attempt: int) -> float:
+    """Determine combien de temps attendre avant de retenter, en priorisant les
+    indications de l'API (header Retry-After, ou champ retryAfterSeconds dans le
+    corps JSON, comme le renvoie SharePoint sur un 503), sinon backoff exponentiel."""
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    try:
+        retry_seconds = resp.json().get("error", {}).get("retryAfterSeconds")
+        if retry_seconds:
+            return float(retry_seconds)
+    except Exception:
+        pass
+    return min(2 ** attempt, MAX_RETRY_DELAY_SECONDS)
+
+
+def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """Wrapper autour de requests.request qui retente automatiquement sur les
+    codes HTTP transitoires (429/500/502/503/504), avec un delai adapte a la
+    reponse de l'API quand elle en fournit un."""
+    attempt = 0
+    while True:
+        resp = requests.request(method, url, **kwargs)
+        if resp.status_code not in TRANSIENT_STATUS_CODES or attempt >= MAX_TRANSIENT_RETRIES:
+            return resp
+        delay = _compute_retry_delay(resp, attempt)
+        print(f"    (Graph a renvoye {resp.status_code}, nouvelle tentative dans {delay:.0f}s...)")
+        time.sleep(delay)
+        attempt += 1
 
 
 class GraphSession:
@@ -119,12 +160,12 @@ class GraphSession:
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
         headers = dict(kwargs.pop("headers", None) or {})
         headers["Authorization"] = f"Bearer {self._token_value()}"
-        resp = requests.request(method, url, headers=headers, **kwargs)
+        resp = request_with_retry(method, url, headers=headers, **kwargs)
         if resp.status_code == 401:
             # Le token a pu expirer entre le check proactif et l'appel reel
             # (run long, latence reseau...). On force un refresh et on retente une fois.
             headers["Authorization"] = f"Bearer {self._token_value(force_refresh=True)}"
-            resp = requests.request(method, url, headers=headers, **kwargs)
+            resp = request_with_retry(method, url, headers=headers, **kwargs)
         return resp
 
     def get(self, url: str, **kwargs) -> requests.Response:
@@ -318,49 +359,48 @@ def upload_file_to_sharepoint(session: GraphSession, drive_id: str, parent_item_
             "Content-Length": str(len(chunk)),
             "Content-Range": f"bytes {start}-{end}/{total}",
         }
-        resp = requests.put(upload_url, headers=put_headers, data=chunk, timeout=120)
+        resp = request_with_retry("PUT", upload_url, headers=put_headers, data=chunk, timeout=120)
         raise_for_status_verbose(resp)
         start = end + 1
+
+
+# --- Email de confirmation (Microsoft Graph) --------------------------------------
+
+
+def send_email(session: GraphSession, sender: str, recipients: str, subject: str, body_text: str) -> None:
+    """Envoie un email via Microsoft Graph (/users/{sender}/sendMail), en app-only.
+    Reutilise la permission Application "Mail.Send" deja accordee a BackupOffice365
+    pour l'automatisation mWater. `recipients` est une liste d'adresses separees
+    par des virgules."""
+    to_recipients = [
+        {"emailAddress": {"address": addr.strip()}}
+        for addr in recipients.split(",")
+        if addr.strip()
+    ]
+    if not to_recipients:
+        print("Aucun destinataire valide dans EMAIL_RECIPIENTS, email non envoye.")
+        return
+
+    url = f"{GRAPH_BASE}/users/{sender}/sendMail"
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body_text},
+            "toRecipients": to_recipients,
+        },
+        "saveToSentItems": "true",
+    }
+    resp = session.post(url, json=payload, timeout=30)
+    raise_for_status_verbose(resp)
+    print(f"Email envoye a {recipients} depuis {sender}.")
 
 
 # --- Programme principal ----------------------------------------------------------
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Extrait les pieces jointes de plusieurs boites mail donnees.")
-    parser.add_argument(
-        "--senders",
-        nargs="+",
-        default=DEFAULT_SENDERS,
-        help=f"Adresses email dont on interroge directement la boite (defaut: {', '.join(DEFAULT_SENDERS)})",
-    )
-    parser.add_argument("--output-dir", default="./pieces_jointes", help="Dossier de sortie local")
-    parser.add_argument(
-        "--keyword",
-        default=os.environ.get("FILTER_KEYWORD", DEFAULT_KEYWORD),
-        help=(
-            f"Mot-cle a rechercher dans l'objet de l'email OU le nom du fichier joint "
-            f"(defaut: {DEFAULT_KEYWORD}). Chaine vide pour desactiver le filtre."
-        ),
-    )
-    parser.add_argument(
-        "--sharepoint-link",
-        default=os.environ.get("SHAREPOINT_FOLDER_LINK"),
-        help="Lien de partage du dossier SharePoint cible (optionnel, sinon variable SHAREPOINT_FOLDER_LINK)",
-    )
-    args = parser.parse_args()
-
-    tenant_id = os.environ.get("AZURE_TENANT_ID")
-    client_id = os.environ.get("AZURE_CLIENT_ID")
-    client_secret = os.environ.get("AZURE_CLIENT_SECRET")
-    if not all([tenant_id, client_id, client_secret]):
-        print("Erreur : AZURE_TENANT_ID, AZURE_CLIENT_ID et AZURE_CLIENT_SECRET doivent etre definis.", file=sys.stderr)
-        return 1
-
-    print("Authentification Microsoft Graph (app-only)...")
-    session = GraphSession(tenant_id, client_id, client_secret)
-    session.ensure_ready()
-
+def run_extraction(session: GraphSession, args: argparse.Namespace) -> dict:
+    """Fait tout le travail d'extraction et retourne un resume (dict) pour le
+    rapport final / l'email de confirmation."""
     keyword_matches = make_keyword_matcher(args.keyword)
     if args.keyword:
         print(f"Filtre actif : objet OU nom de fichier contenant '{args.keyword}'.")
@@ -382,10 +422,13 @@ def main() -> int:
     sp_folder_cache: dict[tuple[str, str], str] = {}
     total_files = 0
     total_duplicates = 0
+    per_mailbox_counts: dict[str, int] = {}
+
     for mailbox in args.senders:
         print(f"\n--- Boite : {mailbox} ---")
         messages = list_all_messages_with_attachments(session, mailbox)
         print(f"{len(messages)} email(s) avec piece(s) jointe(s) dans cette boite (envoi + reception).")
+        per_mailbox_counts[mailbox] = 0
 
         for msg in messages:
             subject = msg.get("subject") or "(sans objet)"
@@ -433,6 +476,7 @@ def main() -> int:
                 dest = unique_path(local_dir / filename)
                 dest.write_bytes(content)
                 total_files += 1
+                per_mailbox_counts[mailbox] += 1
                 print(f"    -> local: {dest}")
 
                 if sp_folder_id:
@@ -445,6 +489,111 @@ def main() -> int:
         print(f"{total_duplicates} doublon(s) detecte(s) et ignore(s) (meme contenu deja enregistre).")
     if sp_drive_id:
         print("Egalement deposees sur SharePoint, classees par sous-dossiers annee/mois (pas de sous-dossier par boite).")
+
+    return {
+        "total_files": total_files,
+        "total_duplicates": total_duplicates,
+        "per_mailbox_counts": per_mailbox_counts,
+        "sharepoint_used": bool(sp_drive_id),
+    }
+
+
+def build_summary_text(stats: dict) -> str:
+    lines = [f"Extraction OV terminee le {date.today().isoformat()}."]
+    lines.append(f"Total : {stats['total_files']} piece(s) jointe(s) enregistree(s).")
+    if stats["total_duplicates"]:
+        lines.append(f"Doublons ignores : {stats['total_duplicates']}.")
+    lines.append("")
+    lines.append("Detail par boite :")
+    for mailbox, count in stats["per_mailbox_counts"].items():
+        lines.append(f"  - {mailbox} : {count} piece(s) jointe(s)")
+    if stats["sharepoint_used"]:
+        lines.append("")
+        lines.append("Fichiers deposes sur SharePoint (classes par annee/mois).")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Extraction OV : pieces jointes filtrees (mot-cle OV) de plusieurs boites mail donnees.")
+    parser.add_argument(
+        "--senders",
+        nargs="+",
+        default=DEFAULT_SENDERS,
+        help=f"Adresses email dont on interroge directement la boite (defaut: {', '.join(DEFAULT_SENDERS)})",
+    )
+    parser.add_argument("--output-dir", default="./pieces_jointes", help="Dossier de sortie local")
+    parser.add_argument(
+        "--keyword",
+        default=os.environ.get("FILTER_KEYWORD", DEFAULT_KEYWORD),
+        help=(
+            f"Mot-cle a rechercher dans l'objet de l'email OU le nom du fichier joint "
+            f"(defaut: {DEFAULT_KEYWORD}). Chaine vide pour desactiver le filtre."
+        ),
+    )
+    parser.add_argument(
+        "--sharepoint-link",
+        default=os.environ.get("SHAREPOINT_FOLDER_LINK"),
+        help="Lien de partage du dossier SharePoint cible (optionnel, sinon variable SHAREPOINT_FOLDER_LINK)",
+    )
+    parser.add_argument(
+        "--email-sender",
+        default=os.environ.get("EMAIL_SENDER"),
+        help="Boite d'envoi de l'email de confirmation (optionnel, sinon variable EMAIL_SENDER)",
+    )
+    parser.add_argument(
+        "--email-recipients",
+        default=os.environ.get("EMAIL_RECIPIENTS"),
+        help="Destinataire(s) de l'email de confirmation, separes par des virgules (optionnel, sinon variable EMAIL_RECIPIENTS)",
+    )
+    args = parser.parse_args()
+
+    tenant_id = os.environ.get("AZURE_TENANT_ID")
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+    client_secret = os.environ.get("AZURE_CLIENT_SECRET")
+    if not all([tenant_id, client_id, client_secret]):
+        print("Erreur : AZURE_TENANT_ID, AZURE_CLIENT_ID et AZURE_CLIENT_SECRET doivent etre definis.", file=sys.stderr)
+        return 1
+
+    print("Authentification Microsoft Graph (app-only)...")
+    session = GraphSession(tenant_id, client_id, client_secret)
+    session.ensure_ready()
+
+    email_enabled = bool(args.email_sender and args.email_recipients)
+    if not email_enabled:
+        print("EMAIL_SENDER / EMAIL_RECIPIENTS non definis : pas d'email de confirmation envoye.")
+
+    try:
+        stats = run_extraction(session, args)
+    except Exception as exc:
+        error_text = f"{exc}\n\n{traceback.format_exc()}"
+        print(f"ERREUR : {exc}", file=sys.stderr)
+        if email_enabled:
+            try:
+                send_email(
+                    session,
+                    args.email_sender,
+                    args.email_recipients,
+                    subject=f"[ECHEC] Extraction OV - {date.today().isoformat()}",
+                    body_text=f"L'extraction des OV a echoue.\n\nErreur :\n{error_text}",
+                )
+            except Exception as mail_exc:
+                print(f"Echec de l'envoi de l'email d'alerte : {mail_exc}", file=sys.stderr)
+        return 1
+
+    if email_enabled:
+        try:
+            send_email(
+                session,
+                args.email_sender,
+                args.email_recipients,
+                subject=f"Extraction OV - {date.today().isoformat()} : {stats['total_files']} fichier(s)",
+                body_text=build_summary_text(stats),
+            )
+        except Exception as mail_exc:
+            # L'extraction elle-meme a reussi : on ne fait pas echouer le run
+            # pour un simple probleme d'envoi d'email, juste un avertissement.
+            print(f"Echec de l'envoi de l'email de confirmation : {mail_exc}", file=sys.stderr)
+
     return 0
 
 

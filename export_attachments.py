@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-export_attachments.py
+export_attachments.py -- "Extraction pieces jointes"
 
 Exporte TOUTES les pieces jointes (pas de filtre par mot-cle, contrairement a
 extract_attachments.py / l'export OV) des emails (envoi comme reception, dans
@@ -60,6 +60,12 @@ DEFAULT_SENDERS = ["eddy.rajaonarivony@madavance.org"]
 CHUNK_SIZE = 320 * 1024 * 30  # ~9,37 Mo
 # Marge de securite avant expiration du token pour declencher un refresh proactif.
 TOKEN_REFRESH_MARGIN_SECONDS = 120
+# Codes HTTP transitoires (surcharge/maintenance cote Graph ou SharePoint) : on
+# retente au lieu d'abandonner tout de suite. Vu en prod : 503 serviceNotAvailable
+# pendant un upload SharePoint, avec un retryAfterSeconds fourni par l'API.
+TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_TRANSIENT_RETRIES = 5
+MAX_RETRY_DELAY_SECONDS = 60
 
 
 def raise_for_status_verbose(resp: requests.Response) -> None:
@@ -68,6 +74,40 @@ def raise_for_status_verbose(resp: requests.Response) -> None:
         raise RuntimeError(
             f"Erreur HTTP {resp.status_code} sur {resp.request.method} {resp.url}\n{resp.text}"
         )
+
+
+def _compute_retry_delay(resp: requests.Response, attempt: int) -> float:
+    """Determine combien de temps attendre avant de retenter, en priorisant les
+    indications de l'API (header Retry-After, ou champ retryAfterSeconds dans le
+    corps JSON, comme le renvoie SharePoint sur un 503), sinon backoff exponentiel."""
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    try:
+        retry_seconds = resp.json().get("error", {}).get("retryAfterSeconds")
+        if retry_seconds:
+            return float(retry_seconds)
+    except Exception:
+        pass
+    return min(2 ** attempt, MAX_RETRY_DELAY_SECONDS)
+
+
+def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """Wrapper autour de requests.request qui retente automatiquement sur les
+    codes HTTP transitoires (429/500/502/503/504), avec un delai adapte a la
+    reponse de l'API quand elle en fournit un."""
+    attempt = 0
+    while True:
+        resp = requests.request(method, url, **kwargs)
+        if resp.status_code not in TRANSIENT_STATUS_CODES or attempt >= MAX_TRANSIENT_RETRIES:
+            return resp
+        delay = _compute_retry_delay(resp, attempt)
+        print(f"    (Graph a renvoye {resp.status_code}, nouvelle tentative dans {delay:.0f}s...)")
+        time.sleep(delay)
+        attempt += 1
 
 
 class GraphSession:
@@ -109,10 +149,10 @@ class GraphSession:
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
         headers = dict(kwargs.pop("headers", None) or {})
         headers["Authorization"] = f"Bearer {self._token_value()}"
-        resp = requests.request(method, url, headers=headers, **kwargs)
+        resp = request_with_retry(method, url, headers=headers, **kwargs)
         if resp.status_code == 401:
             headers["Authorization"] = f"Bearer {self._token_value(force_refresh=True)}"
-            resp = requests.request(method, url, headers=headers, **kwargs)
+            resp = request_with_retry(method, url, headers=headers, **kwargs)
         return resp
 
     def get(self, url: str, **kwargs) -> requests.Response:
@@ -284,7 +324,7 @@ def upload_file_to_sharepoint(session: GraphSession, drive_id: str, parent_item_
             "Content-Length": str(len(chunk)),
             "Content-Range": f"bytes {start}-{end}/{total}",
         }
-        resp = requests.put(upload_url, headers=put_headers, data=chunk, timeout=120)
+        resp = request_with_retry("PUT", upload_url, headers=put_headers, data=chunk, timeout=120)
         raise_for_status_verbose(resp)
         start = end + 1
 
@@ -415,7 +455,7 @@ def build_summary_text(stats: dict) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Exporte toutes les pieces jointes d'une ou plusieurs boites mail donnees.")
+    parser = argparse.ArgumentParser(description="Extraction pieces jointes : exporte TOUTES les pieces jointes (sans filtre) d'une ou plusieurs boites mail donnees.")
     parser.add_argument(
         "--senders",
         nargs="+",
